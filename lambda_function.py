@@ -6,13 +6,14 @@ import os
 import traceback
 from dotenv import load_dotenv
 import boto3
+# Removed asyncio and aiohttp imports
 
 # --- Configuration ---
 load_dotenv() # Load variables from .env file into environment
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
 S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
 STATE_FILE_KEY = os.getenv('STATE_FILE_KEY', 'course_state.json')
-DISCORD_USER_ID_TO_PING = os.getenv('DISCORD_USER_ID_TO_PING')
+DISCORD_USER_ID_TO_PING = os.getenv('DISCORD_USER_ID_TO_PING') # Read from .env
 
 COURSE_PREFIXES_TO_FETCH = ["cmsc3", "cmsc4"]
 SPECIFIC_3XX_COURSES = ["CMSC320", "CMSC335"]
@@ -28,11 +29,13 @@ SOC_SECTION_URL_TEMPLATE = "https://app.testudo.umd.edu/soc/{term_id}/sections?c
 
 SEND_DISCORD_NOTIFICATION = True
 SEND_NO_UPDATES_MESSAGE = True
-SECTION_FETCH_DELAY = 0.5
+SECTION_FETCH_DELAY = 0.5 # Reintroduce delay for sequential requests
 PARSE_ERROR_DEFAULT = -999
 
+# Initialize S3 client (Lambda runtime manages credentials via IAM role)
 s3_client = boto3.client('s3')
 
+# --- Helper Functions ---
 def fetch_initial_page(url):
     """Fetches a search results page HTML using requests (sync)."""
     try:
@@ -48,6 +51,7 @@ def fetch_initial_page(url):
     except Exception as parse_e:
         print(f"Error parsing initial page: {parse_e}")
         return None
+
 
 def fetch_section_details(course_id, term_id, search_url_base):
     """Fetches section details HTML snippet using requests (sync)."""
@@ -81,7 +85,10 @@ def process_course_prefixes(prefixes, specific_3xx, excluded, term_id):
     """
     all_courses_data = {}
     courses_to_process = {}
+
     print(f"Processing prefixes sequentially: {', '.join(prefixes)}")
+
+    # Step 1: Fetch initial pages and extract relevant Course IDs/Titles
     for prefix in prefixes:
         search_url = SOC_SEARCH_URL_TEMPLATE.format(prefix=prefix, term_id=term_id)
         initial_soup = fetch_initial_page(search_url)
@@ -89,23 +96,45 @@ def process_course_prefixes(prefixes, specific_3xx, excluded, term_id):
         course_divs = initial_soup.find_all('div', class_='course')
         if not course_divs: continue
         print(f"Found {len(course_divs)} course divs for prefix {prefix}.")
+
         for course_div in course_divs:
-            course_id, course_title = None, "Unknown Title"
+            course_id = None
+            course_title = "Unknown Title"
+            # --- FIX: Initialize course_div_id here ---
+            course_div_id = None
+
+            # Try getting ID from hidden input first
             course_id_input = course_div.find('input', {'name': 'courseId'})
-            if course_id_input and course_id_input.get('value'): course_id = course_id_input['value']
-            else: course_div_id = course_div.get('id');
-            if course_div_id: course_id = course_div_id
+            if course_id_input and course_id_input.get('value'):
+                course_id = course_id_input['value']
+            else: # Fallback to div ID
+                course_div_id = course_div.get('id')
+                if course_div_id:
+                     course_id = course_div_id
+
+            # Try getting title
             title_span = course_div.find('span', class_='course-title')
             if title_span: course_title = title_span.text.strip()
-            if not course_id: continue
+
+            if not course_id:
+                 print("Warning: Could not find courseId for a course block.")
+                 continue
+
+            # --- Filtering Logic ---
             is_relevant = False
-            if course_id in excluded: continue
+            if course_id in excluded: continue # Skip excluded courses immediately
             elif prefix == "cmsc3" and course_id in specific_3xx: is_relevant = True
-            elif prefix == "cmsc4": is_relevant = True
+            elif prefix == "cmsc4": is_relevant = True # All 4xx relevant unless excluded
+
             if is_relevant: courses_to_process[course_id] = course_title
+    # --- End Step 1 ---
+
     if not courses_to_process: return {}
     num_courses = len(courses_to_process); print(f"\nCollected {num_courses} relevant course IDs: {', '.join(courses_to_process.keys())}")
+
+    # Step 2 & 3: Fetch and Parse Sections Sequentially
     count = 0; search_url_base = SOC_SEARCH_URL_TEMPLATE.format(prefix=prefixes[0], term_id=term_id).split('?')[0]
+
     for course_id, title in courses_to_process.items():
         count += 1; print(f"Processing: {course_id} ({count}/{num_courses})")
         all_courses_data[course_id] = {"title": title, "sections": {}}
@@ -171,6 +200,7 @@ def compare_states(old_state, new_state):
                 if section_id not in new_sections: changes.append({"type": "SECTION_REMOVED", "course": course_id, "title": old_course_data.get("title", "Unknown"), "section": section_id, "data": old_section_data})
     return changes
 
+# --- Formatting ---
 def get_status_emoji(open_seats, total_seats):
     if open_seats == 0: return "🔴 "
     elif open_seats > 0 and open_seats < total_seats: return "⏳ "
@@ -237,21 +267,19 @@ def format_initial_state(state_data):
             lines.append(f"  • {status_emoji}`{section_id}`: Open: {opn_str}, Total: {tot_str}, Waitlist: {wl_str}, Instr: {instr}")
     return "\n".join(lines)
 
+# --- Discord Notification ---
 def send_discord_notification(data_to_send, is_initial_state=False, is_error_message=False, is_no_updates=False):
     """Sends notification(s) to Discord, adding user ping for updates."""
     if not DISCORD_WEBHOOK_URL: print("Discord Webhook URL not found. Skipping."); return
 
-    user_ping = ""
-    is_change_update = not is_initial_state and not is_error_message and not is_no_updates and isinstance(data_to_send, list) and data_to_send
-    if is_change_update and DISCORD_USER_ID_TO_PING:
-        user_ping = f"<@{DISCORD_USER_ID_TO_PING}> "
+    user_ping = ""; is_change_update = not is_initial_state and not is_error_message and not is_no_updates and isinstance(data_to_send, list) and data_to_send
+    if is_change_update and DISCORD_USER_ID_TO_PING: user_ping = f"<@{DISCORD_USER_ID_TO_PING}> "
 
-    message_header = f"{user_ping}**UMD Course Section Update:**\n" if is_change_update else "" # Header only for changes
-    changes_summary = ""
-    use_code_block = is_change_update # Only use code blocks for change lists
+    message_header = f"{user_ping}**UMD Course Section Update:**\n" if is_change_update else ""
+    changes_summary = ""; use_code_block = is_change_update
 
-    if is_initial_state: changes_summary = data_to_send; message_header = "" # No ping/header for initial
-    elif isinstance(data_to_send, str): changes_summary = data_to_send; message_header = "" # No ping/header for simple messages
+    if is_initial_state: changes_summary = data_to_send; message_header = ""
+    elif isinstance(data_to_send, str): changes_summary = data_to_send; message_header = ""
     elif is_change_update: change_lines = [format_change_message(change) for change in data_to_send]; changes_summary = "\n".join(change_lines)
     else: print("No valid data to send to Discord."); return
 
@@ -277,7 +305,6 @@ def send_discord_notification(data_to_send, is_initial_state=False, is_error_mes
         if not message_content.strip(): continue; message_content = message_content.replace("```\n```", "")
         payload = {"content": message_content}
         if user_ping: payload["allowed_mentions"] = {"users": [DISCORD_USER_ID_TO_PING]}
-
         try:
             response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15); response.raise_for_status()
             print(f"Discord part sent! (Length: {len(message_content)})"); time.sleep(1.2)
@@ -287,52 +314,71 @@ def send_discord_notification(data_to_send, is_initial_state=False, is_error_mes
             success = False; break
     if success and messages_to_send: print("All Discord parts sent.")
 
-
 # --- Lambda Handler ---
 def lambda_handler(event, context):
     """AWS Lambda entry point."""
     start_time = time.time()
     print(f"Lambda function started at {time.ctime()}...")
-    if not S3_BUCKET_NAME:
-        print("🛑 ERROR: S3_BUCKET_NAME env var not set.")
-        if SEND_DISCORD_NOTIFICATION and DISCORD_WEBHOOK_URL: send_discord_notification("Error Alert ⚠️: S3_BUCKET_NAME not configured.", is_error_message=True)
-        return {'statusCode': 500, 'body': json.dumps('S3 Bucket Name not configured')}
-    if SEND_DISCORD_NOTIFICATION and not DISCORD_USER_ID_TO_PING:
-         print("⚠️ WARNING: DISCORD_USER_ID_TO_PING not set in environment. Update notifications will not ping.")
+    if not S3_BUCKET_NAME: print("🛑 ERROR: S3_BUCKET_NAME env var not set.");
+    if SEND_DISCORD_NOTIFICATION and not DISCORD_WEBHOOK_URL: print("🛑 ERROR: DISCORD_WEBHOOK_URL env var not set."); # Check webhook URL early
+    if SEND_DISCORD_NOTIFICATION and not DISCORD_USER_ID_TO_PING: print("⚠️ WARNING: DISCORD_USER_ID_TO_PING not set. Update notifications will not ping.") # Check ping ID
 
     old_state = load_previous_state_s3()
     fetched_state = process_course_prefixes(COURSE_PREFIXES_TO_FETCH, SPECIFIC_3XX_COURSES, COURSES_TO_EXCLUDE, TERM_ID)
 
     new_state = {}; fetch_errors = []
+    processed_courses_ids = set(fetched_state.keys()) # Keep track of courses processed in this run
+
+    # Merge fetched state with old state for courses with fetch errors
     for course_id, data in fetched_state.items():
-        if data.get("fetch_error"): fetch_errors.append(course_id);
-        if course_id in old_state: new_state[course_id] = old_state[course_id] # Reuse old on error
-        else: new_state[course_id] = data 
+        if data.get("fetch_error"):
+            fetch_errors.append(course_id)
+            if course_id in old_state:
+                print(f" -> Reusing old state data for {course_id} due to fetch error.")
+                new_state[course_id] = old_state[course_id] # Reuse old data
+                # Optionally mark it as stale? Could add "stale": True
+            else:
+                 print(f" -> Fetch error for new course {course_id}. No old data available.")
+                 new_state[course_id] = data # Keep error marker but no sections
+        else:
+            new_state[course_id] = data # Use fresh data
+
+    # Retain old courses that weren't even in the fetched list (e.g., if a whole prefix fails to load)
+    # This prevents incorrectly marking sections as removed if the initial page load fails.
     for course_id, old_data in old_state.items():
-        if course_id not in new_state: new_state[course_id] = old_data; # Retain old if missing now
-        if course_id not in fetch_errors: fetch_errors.append(f"{course_id} (missing)")
+        if course_id not in new_state:
+             print(f" -> Course {course_id} missing from current fetch results; retaining old data.")
+             new_state[course_id] = old_data # Retain old data entirely
+             if course_id not in fetch_errors: fetch_errors.append(f"{course_id} (missing from fetch)")
+
 
     print("\n--- Final State Summary ---"); num_courses = len(new_state); num_sections = sum(len(d.get("sections", {})) for d in new_state.values())
     print(f"Processed {num_courses} courses, {num_sections} sections.");
-    if fetch_errors: print(f"Note: Data for {', '.join(fetch_errors)} may be stale.")
+    if fetch_errors: print(f"Note: Data for {len(fetch_errors)} course(s) may be stale: {', '.join(fetch_errors)}")
     print("---------------------------\n")
 
-    parsing_successful = any(d.get("sections") for d in new_state.values()); current_status_code = 200
+    # Parsing successful if at least one section was found, or if no courses were expected
+    parsing_successful = any(d.get("sections") for d in new_state.values()) or not processed_courses_ids
 
-    if not parsing_successful and bool(new_state) and old_state :
-        print("WARN: Parsing failed. Skipping update.");
-        if SEND_DISCORD_NOTIFICATION: send_discord_notification("Error Alert ⚠️: Failed parsing sections. Check logs.", is_error_message=True)
-        return {'statusCode': 200, 'body': json.dumps('Parsing failed, skipped update.')}
-    elif not parsing_successful and bool(new_state) and not old_state:
-        print("ERROR: Failed parsing sections on first run.")
-        if SEND_DISCORD_NOTIFICATION: send_discord_notification("Error Alert ⚠️: Failed parsing sections on initial run.", is_error_message=True)
-        return {'statusCode': 500, 'body': json.dumps('Failed parsing on initial run.')}
+    current_status_code = 200 # Assume success unless save fails
 
+    # Handle parse failures only if courses were expected but no sections found
+    if not parsing_successful and processed_courses_ids:
+        if old_state: # Failure on subsequent run
+            print("WARN: Parsing failed (no sections found). Skipping update.")
+            if SEND_DISCORD_NOTIFICATION: send_discord_notification("Error Alert ⚠️: Failed parsing sections. Check logs.", is_error_message=True)
+            return {'statusCode': 200, 'body': json.dumps('Parsing failed, skipped update.')}
+        else: # Failure on first run
+            print("ERROR: Failed parsing sections on first run.")
+            if SEND_DISCORD_NOTIFICATION: send_discord_notification("Error Alert ⚠️: Failed parsing sections on initial run.", is_error_message=True)
+            return {'statusCode': 500, 'body': json.dumps('Failed parsing on initial run.')}
+
+    # Initial Run or Subsequent Runs
     if not old_state:
         print("First run successful. Initializing state in S3.")
         initial_summary = format_initial_state(new_state)
         if SEND_DISCORD_NOTIFICATION: send_discord_notification(initial_summary, is_initial_state=True);
-        if fetch_errors: send_discord_notification(f"⚠️ Initial fetch failed for: {', '.join(fetch_errors)}.", is_error_message=True)
+        if fetch_errors: send_discord_notification(f"⚠️ Initial fetch failed/stale for: {', '.join(fetch_errors)}.", is_error_message=True)
         save_success = save_current_state_s3(new_state); print("Initial state " + ("saved." if save_success else "FAILED to save."))
         if not save_success: current_status_code = 500
     else:
@@ -340,19 +386,18 @@ def lambda_handler(event, context):
         if changes:
             print("\n--- CHANGES DETECTED ---"); [print(format_change_message(c)) for c in changes]; print("------------------------\n")
             if SEND_DISCORD_NOTIFICATION: send_discord_notification(changes); # Ping happens inside
-            if fetch_errors: send_discord_notification(f"⚠️ Update check failed for: {', '.join(fetch_errors)}. Status reflects last known data.", is_error_message=True)
+            if fetch_errors: send_discord_notification(f"⚠️ Some course data may be stale due to fetch errors: {', '.join(fetch_errors)}.", is_error_message=True)
             save_success = save_current_state_s3(new_state); print("Changes detected. State " + ("saved." if save_success else "FAILED to save."))
-            if not save_success: current_status_code = 500 # Report error if save fails
+            if not save_success: current_status_code = 500
         else:
             print("No significant changes detected.")
             if SEND_DISCORD_NOTIFICATION:
                 if SEND_NO_UPDATES_MESSAGE: send_discord_notification(f"✅ No course section updates found at {time.strftime('%H:%M:%S UTC')}.", is_no_updates=True)
-                if fetch_errors: send_discord_notification(f"⚠️ Update check failed for: {', '.join(fetch_errors)}. Status reflects last known data.", is_error_message=True)
+                if fetch_errors: send_discord_notification(f"⚠️ No changes, but fetch failed/stale for: {', '.join(fetch_errors)}.", is_error_message=True)
             if fetch_errors: # Save state even if no changes but fetch errors occurred to preserve merged data
                  save_success = save_current_state_s3(new_state); print("Saving merged state " + ("succeeded." if save_success else "FAILED."))
                  if not save_success: current_status_code = 500
             else: print("No state save needed.")
-
 
     end_time = time.time(); duration = end_time - start_time
     print(f"Lambda function finished. Duration: {duration:.2f} seconds.")
@@ -362,12 +407,12 @@ def lambda_handler(event, context):
 if __name__ == "__main__":
     print("Running script locally...")
     if not DISCORD_WEBHOOK_URL: print("🛑 WARNING: DISCORD_WEBHOOK_URL not found.")
-    if SEND_DISCORD_NOTIFICATION and not DISCORD_USER_ID_TO_PING:
-         print("⚠️ WARNING: DISCORD_USER_ID_TO_PING not set in .env file. Update notifications will not ping.")
+    if SEND_DISCORD_NOTIFICATION and not DISCORD_USER_ID_TO_PING: print("⚠️ WARNING: DISCORD_USER_ID_TO_PING not set in .env file. Update notifications will not ping.")
 
     if not S3_BUCKET_NAME:
          print("🛑 WARNING: S3_BUCKET_NAME not found. Using local file 'course_state_local.json'.")
-         STATE_FILE = "course_state_local.json"
+         STATE_FILE = "course_state_local.json" # Use local file name
+         # Redefine state functions for local files
          def load_previous_state_local():
              try:
                  with open(STATE_FILE, 'r') as f: return json.load(f)
@@ -380,10 +425,8 @@ if __name__ == "__main__":
          save_current_state_s3 = save_current_state_local
     else:
          print(f"Using S3 bucket '{S3_BUCKET_NAME}' for state.")
-         # Keep original S3 functions assigned
-         load_previous_state_s3 = load_previous_state_s3
-         save_current_state_s3 = save_current_state_s3
+         # Keep original S3 functions assigned (already defined globally)
 
-    # --- Simulate Lambda handler call ---
+    # Simulate Lambda handler call for local testing
     lambda_handler({}, {})
 
